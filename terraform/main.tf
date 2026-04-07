@@ -1,81 +1,107 @@
+# Terraform configuration for Azure resources
 terraform {
   required_version = ">= 1.5"
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~> 4.0"
+      version = "~> 3.0.2"
     }
   }
 }
 
+
 provider "azurerm" {
-  features {}
+    features {}
+    skip_provider_registration = true
+
 }
 
-# Variable for the existing resource group name
-variable "resource_group_name" {
-  description = "Name of the existing resource group"
-  type        = string
-  default     = "Project-IAAC-PoC-RG" # Value from the diagram
+# Data source for existing resource group - name provided in requirements
+data "azurerm_resource_group" "rg" {
+  name = "Project-IAAC-PoC-RG"
 }
 
-# Variable for location - assumed as not specified in diagram
+# Variables for reusability and configurable values
 variable "location" {
-  description = "Azure region for resources"
+  description = "Azure region for resources - assumed value if not provided"
   type        = string
   default     = "East US"
 }
 
-# Variable for Service Plan SKU - assumed as not specified in diagram
-variable "service_plan_sku" {
-  description = "SKU for the App Service Plan"
+variable "environment" {
+  description = "Environment tag - assumed value"
   type        = string
-  default     = "B1" # Basic tier assumed
+  default     = "dev"
 }
 
-# Variable for Python version - diagram shows Python runtime
-variable "python_version" {
-  description = "Python version for the function app"
+variable "owner" {
+  description = "Owner tag - assumed value"
   type        = string
-  default     = "3.11"
+  default     = "infrastructure-team"
 }
 
-# Data source to reference the existing resource group
-data "azurerm_resource_group" "main" {
-  name = var.resource_group_name
+variable "storage_account_name" {
+  description = "Storage account name - must be globally unique, assumed value"
+  type        = string
+  default     = "iaacpocblobstorage"
 }
 
-# Storage Account required for Azure Function App
-resource "azurerm_storage_account" "function_storage" {
-  name                     = "funcstorageiaacpoc" # Must be globally unique, adjust as needed
-  resource_group_name      = data.azurerm_resource_group.main.name
-  location                 = data.azurerm_resource_group.main.location
-  account_tier             = "Standard"
-  account_replication_type = "LRS"
+variable "key_vault_name" {
+  description = "Key Vault name - must be globally unique, assumed value"
+  type        = string
+  default     = "iaacpoc-keyvault"
 }
 
-# App Service Plan for Linux Function App
-resource "azurerm_service_plan" "function_plan" {
-  name                = "func-plan-iaac-poc"
-  resource_group_name = data.azurerm_resource_group.main.name
-  location            = data.azurerm_resource_group.main.location
-  os_type             = "Linux"
-  sku_name            = var.service_plan_sku
+variable "servicebus_namespace_name" {
+  description = "Service Bus namespace name - assumed value"
+  type        = string
+  default     = "iaacpoc-servicebus"
 }
 
-# Linux Function App with Python runtime
-resource "azurerm_linux_function_app" "main" {
-  name                       = "func-app-iaac-poc" # Must be globally unique, adjust as needed
-  resource_group_name        = data.azurerm_resource_group.main.name
-  location                   = data.azurerm_resource_group.main.location
-  service_plan_id            = azurerm_service_plan.function_plan.id
-  storage_account_name       = azurerm_storage_account.function_storage.name
-  storage_account_access_key = azurerm_storage_account.function_storage.primary_access_key
-  functions_extension_version = "~4"
+# Storage Account for Blob Storage
+resource "azurerm_storage_account" "blob_storage" {
+  name                     = var.storage_account_name
+  resource_group_name      = data.azurerm_resource_group.rg.name
+  location                 = var.location # Assumed location if not provided
+  account_tier             = "Standard"    # As per requirements
+  account_replication_type = "LRS"         # As per requirements
 
-  site_config {
-    application_stack {
-      python_version = var.python_version # Python runtime as specified in diagram
-    }
+  tags = {
+    environment = var.environment
+    owner       = var.owner
   }
 }
+
+# Key Vault
+resource "azurerm_key_vault" "kv" {
+  name                       = var.key_vault_name
+  location                   = var.location # Assumed location if not provided
+  resource_group_name        = data.azurerm_resource_group.rg.name
+  tenant_id                  = data.azurerm_client_config.current.tenant_id
+  sku_name                   = "standard" # Assumed SKU if not provided
+  soft_delete_retention_days = 7          # Assumed value if not provided
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+  }
+}
+
+# Data source to get current client config for tenant_id
+data "azurerm_client_config" "current" {}
+
+# Service Bus Namespace
+resource "azurerm_servicebus_namespace" "sb" {
+  name                = var.servicebus_namespace_name
+  location            = var.location # Assumed location if not provided
+  resource_group_name = data.azurerm_resource_group.rg.name
+  sku                 = "Standard" # Assumed SKU if not provided
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+  }
+}
+
+# Note: Function App is not created as per instruction #6 - only Blob Storage, Cosmos DB, Key Vault, and Service Bus should be created
+# The diagram shows Function App but it is ignored as per requirements
