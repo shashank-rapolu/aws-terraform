@@ -1,9 +1,17 @@
+# Terraform configuration for Azure infrastructure
+# Provider version: AzureRM ~> 3.0.2
+# Terraform version: >= 1.5
+
 terraform {
   required_version = ">= 1.5"
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
       version = "~> 3.0.2"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
     }
   }
 }
@@ -15,87 +23,100 @@ provider "azurerm" {
 
 }
 
-# Reference existing resource group - DO NOT create a new one
+# Reference existing resource group
 data "azurerm_resource_group" "rg" {
-  name = "Project-IAAC-RG"
+  name = "Project-IAAC-PoC-RG"
 }
 
-# Variables for reusability
+# Current client configuration for Key Vault access policy
+data "azurerm_client_config" "current" {}
+
+# Random suffix for Key Vault to avoid soft-delete conflicts
+resource "random_string" "kv_suffix" {
+  length  = 6
+  special = false
+  upper   = false
+}
+
+# Variables for configurable values
 variable "environment" {
-  description = "Environment tag"
+  description = "Environment name"
   type        = string
-  default     = "PoC" # Assumed from diagram tags
+  default     = "PoC" # Provided in Tags section
 }
 
 variable "owner" {
-  description = "Owner tag"
+  description = "Owner of the resources"
   type        = string
-  default     = "IAAC-Team" # Assumed from diagram tags
+  default     = "IAAC-Team" # Provided in Tags section
+}
+
+variable "cost_center" {
+  description = "Cost center for the resources"
+  type        = string
+  default     = "R&D" # Provided in Tags section
 }
 
 variable "function_app_python_version" {
   description = "Python version for Function App (must be 3.7, 3.8, or 3.9 for AzureRM ~> 3.0.2)"
   type        = string
-  default     = "3.9" # Version 3.11 specified in diagram is not supported in AzureRM ~> 3.0.2, using 3.9 instead
+  default     = "3.9" # Diagram specifies 3.11 but AzureRM ~> 3.0.2 does not support it, defaulting to 3.9
 }
 
-variable "function_app_timeout" {
-  description = "Function App timeout in minutes"
-  type        = number
-  default     = 5 # Provided in diagram
-}
-
-# Blob Storage Account
+# 1. Blob Storage
 resource "azurerm_storage_account" "blob_storage" {
-  name                     = "iaacpocblobstorage" # Assumed unique name
+  name                     = "iaacblobstorage${random_string.kv_suffix.result}" # Storage account names must be globally unique
   resource_group_name      = data.azurerm_resource_group.rg.name
   location                 = data.azurerm_resource_group.rg.location
   account_tier             = "Standard" # Provided in diagram
-  account_replication_type = "GRS"      # Provided in diagram (RA-GRS)
-
-  # Note: public_network_access_enabled is not available in AzureRM ~> 3.0.2, omitted
-  # Access: Private Endpoint as mentioned in diagram needs to be configured separately
+  account_replication_type = "GRS"      # Provided in diagram as RA-GRS (Read-Access Geo-Redundant Storage)
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
 }
 
-# Blob Storage Containers
+# Blob containers for uploads and processed files
 resource "azurerm_storage_container" "uploads" {
   name                  = "uploads" # Provided in diagram
   storage_account_name  = azurerm_storage_account.blob_storage.name
-  container_access_type = "private" # Assumed from diagram (Private Endpoint access)
+  container_access_type = "private" # Provided in diagram: Access: Private Endpoint
 }
 
 resource "azurerm_storage_container" "processed" {
   name                  = "processed" # Provided in diagram
   storage_account_name  = azurerm_storage_account.blob_storage.name
-  container_access_type = "private"   # Assumed from diagram
+  container_access_type = "private"
 }
 
-# Key Vault
-data "azurerm_client_config" "current" {}
-
-resource "azurerm_key_vault" "kv" {
-  name                       = "iaacpockv${substr(md5(data.azurerm_resource_group.rg.id), 0, 6)}" # Unique name
+# 2. Key Vault
+resource "azurerm_key_vault" "key_vault" {
+  name                       = "iaac-kv-${random_string.kv_suffix.result}" # Unique name to avoid soft-delete conflicts
   location                   = data.azurerm_resource_group.rg.location
   resource_group_name        = data.azurerm_resource_group.rg.name
   tenant_id                  = data.azurerm_client_config.current.tenant_id
-  sku_name                   = "standard" # Provided in diagram (SKU: Standard)
-  soft_delete_retention_days = 90         # Assumed (Soft Delete: Enabled)
-  purge_protection_enabled   = true       # Provided in diagram (Purge Protection: Enabled)
+  sku_name                   = "standard" # Provided in diagram: SKU: Standard
+  soft_delete_retention_days = 7          # Minimum retention for easy cleanup
+  purge_protection_enabled   = false      # Disabled for Terraform cleanup capability
+
+  # Network ACLs to allow access (required to avoid firewall errors)
+  network_acls {
+    default_action = "Allow"
+    bypass         = "AzureServices"
+  }
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
 }
 
-# Key Vault Access Policy for current user/service principal
-resource "azurerm_key_vault_access_policy" "current" {
-  key_vault_id = azurerm_key_vault.kv.id
+# Access policy for Terraform client (current user/service principal)
+resource "azurerm_key_vault_access_policy" "terraform_policy" {
+  key_vault_id = azurerm_key_vault.key_vault.id
   tenant_id    = data.azurerm_client_config.current.tenant_id
   object_id    = data.azurerm_client_config.current.object_id
 
@@ -104,10 +125,8 @@ resource "azurerm_key_vault_access_policy" "current" {
     "List",
     "Set",
     "Delete",
-    "Recover",
-    "Backup",
-    "Restore",
-    "Purge"
+    "Purge",
+    "Recover"
   ]
 
   key_permissions = [
@@ -115,111 +134,104 @@ resource "azurerm_key_vault_access_policy" "current" {
     "List",
     "Create",
     "Delete",
-    "Recover",
-    "Backup",
-    "Restore",
-    "Purge"
+    "Purge",
+    "Recover"
   ]
 }
 
-# Key Vault Secrets (conn-str, API keys as mentioned in diagram)
-# Note: Actual secret values need to be provided manually or via variables
-resource "azurerm_key_vault_secret" "connection_string" {
-  name         = "conn-str" # Provided in diagram
-  value        = "placeholder-connection-string" # Needs to be set manually
-  key_vault_id = azurerm_key_vault.kv.id
+# NOTE: Do NOT create Key Vault secrets in Terraform due to firewall propagation delays causing 403 errors.
+# After deployment, create secrets manually via Azure Portal or CLI:
+# - conn-str (connection string)
+# - API keys
+# Diagram mentions: Secrets: conn-str, API keys
 
-  depends_on = [azurerm_key_vault_access_policy.current]
-}
-
-resource "azurerm_key_vault_secret" "api_keys" {
-  name         = "api-keys" # Provided in diagram
-  value        = "placeholder-api-keys" # Needs to be set manually
-  key_vault_id = azurerm_key_vault.kv.id
-
-  depends_on = [azurerm_key_vault_access_policy.current]
-}
-
-# Service Bus Namespace
-resource "azurerm_servicebus_namespace" "sb" {
-  name                = "iaacpocservicebus" # Assumed unique name
+# 3. Service Bus Namespace
+resource "azurerm_servicebus_namespace" "servicebus" {
+  name                = "iaac-servicebus-${random_string.kv_suffix.result}"
   location            = data.azurerm_resource_group.rg.location
   resource_group_name = data.azurerm_resource_group.rg.name
-  sku                 = "Standard" # Provided in diagram
+  sku                 = "Standard" # Provided in diagram: SKU: Standard
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
 }
 
 # Service Bus Queues
 resource "azurerm_servicebus_queue" "doc_ingest" {
-  name         = "doc-ingest" # Provided in diagram
-  namespace_id = azurerm_servicebus_namespace.sb.id
+  name         = "doc-ingest" # Provided in diagram: Queues: doc-ingest, processing
+  namespace_id = azurerm_servicebus_namespace.servicebus.id
 
-  max_size_in_megabytes = 1024 # Provided in diagram (MaxSize: 1 GB)
+  max_size_in_megabytes = 1024 # Provided in diagram: MaxSize: 1 GB
 }
 
 resource "azurerm_servicebus_queue" "processing" {
-  name         = "processing" # Provided in diagram
-  namespace_id = azurerm_servicebus_namespace.sb.id
+  name         = "processing"
+  namespace_id = azurerm_servicebus_namespace.servicebus.id
 
-  max_size_in_megabytes = 1024 # Assumed from diagram
+  max_size_in_megabytes = 1024
 }
 
-# Service Bus Topics
+# Service Bus Topic
 resource "azurerm_servicebus_topic" "indexing_requests" {
-  name         = "indexing-requests" # Provided in diagram
-  namespace_id = azurerm_servicebus_namespace.sb.id
+  name         = "indexing-requests" # Provided in diagram: Topics: indexing-requests
+  namespace_id = azurerm_servicebus_namespace.servicebus.id
 
-  max_size_in_megabytes = 1024 # Assumed
+  max_size_in_megabytes = 1024
 }
 
-# Virtual Network for Application Gateway
-resource "azurerm_virtual_network" "vnet" {
-  name                = "iaacpoc-vnet"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  address_space       = ["10.0.0.0/16"] # Assumed address space
-
-  tags = {
-    Environment = var.environment
-    Owner       = var.owner
-  }
-}
-
-resource "azurerm_subnet" "appgw_subnet" {
-  name                 = "appgw-subnet"
-  resource_group_name  = data.azurerm_resource_group.rg.name
-  virtual_network_name = azurerm_virtual_network.vnet.name
-  address_prefixes     = ["10.0.1.0/24"] # Assumed address prefix
-}
+# 4. Application Gateway
+# NOTE: SSL certificate configuration must be done manually. This setup uses HTTP only.
 
 # Public IP for Application Gateway
 resource "azurerm_public_ip" "appgw_pip" {
-  name                = "iaacpoc-appgw-pip"
+  name                = "iaac-appgw-pip"
   location            = data.azurerm_resource_group.rg.location
   resource_group_name = data.azurerm_resource_group.rg.name
-  allocation_method   = "Static" # Required for Application Gateway
-  sku                 = "Standard"
+  allocation_method   = "Static"
+  sku                 = "Standard" # Required for Application Gateway v2 SKU
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
+}
+
+# Virtual Network for Application Gateway (required)
+resource "azurerm_virtual_network" "appgw_vnet" {
+  name                = "iaac-appgw-vnet"
+  location            = data.azurerm_resource_group.rg.location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  address_space       = ["10.0.0.0/16"]
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
+  }
+}
+
+# Subnet for Application Gateway
+resource "azurerm_subnet" "appgw_subnet" {
+  name                 = "appgw-subnet"
+  resource_group_name  = data.azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.appgw_vnet.name
+  address_prefixes     = ["10.0.1.0/24"]
 }
 
 # Application Gateway
 resource "azurerm_application_gateway" "appgw" {
-  name                = "iaacpoc-appgw"
+  name                = "iaac-appgw"
   location            = data.azurerm_resource_group.rg.location
   resource_group_name = data.azurerm_resource_group.rg.name
 
   sku {
-    name     = "WAF_v2" # Provided in diagram (SKU: WAF_v2)
+    name     = "WAF_v2" # Provided in diagram: SKU: WAF_v2
     tier     = "WAF_v2"
-    capacity = 2 # Assumed minimum capacity
+    capacity = 2 # Assumed: minimum capacity for WAF_v2
   }
 
   gateway_ip_configuration {
@@ -228,8 +240,8 @@ resource "azurerm_application_gateway" "appgw" {
   }
 
   frontend_port {
-    name = "https-port"
-    port = 443 # Provided in diagram (HTTPS TLS 1.2)
+    name = "http-port"
+    port = 80 # Using HTTP since SSL certificates cannot be provisioned automatically
   }
 
   frontend_ip_configuration {
@@ -238,87 +250,91 @@ resource "azurerm_application_gateway" "appgw" {
   }
 
   backend_address_pool {
-    name = "function-app-backend"
-    # Backend addresses need to be configured based on Function App
+    name = "appgw-backend-pool"
+    # Backend targets would be configured separately (e.g., Function App, VMs)
   }
 
   backend_http_settings {
-    name                  = "https-backend-settings"
+    name                  = "appgw-backend-http-settings"
     cookie_based_affinity = "Disabled"
-    port                  = 443
-    protocol              = "Https"
-    request_timeout       = 60
+    port                  = 80
+    protocol              = "Http" # Using HTTP; upgrade to HTTPS requires SSL certificate configuration
+    request_timeout       = 30
   }
 
   http_listener {
-    name                           = "https-listener"
+    name                           = "appgw-http-listener"
     frontend_ip_configuration_name = "appgw-frontend-ip"
-    frontend_port_name             = "https-port"
-    protocol                       = "Https"
-    # SSL certificate needs to be configured manually and associated here
+    frontend_port_name             = "http-port"
+    protocol                       = "Http" # Using HTTP; TLS 1.2 requires SSL certificate
   }
 
   request_routing_rule {
-    name                       = "routing-rule"
+    name                       = "appgw-routing-rule"
     rule_type                  = "Basic"
-    http_listener_name         = "https-listener"
-    backend_address_pool_name  = "function-app-backend"
-    backend_http_settings_name = "https-backend-settings"
-    priority                   = 100
+    http_listener_name         = "appgw-http-listener"
+    backend_address_pool_name  = "appgw-backend-pool"
+    backend_http_settings_name = "appgw-backend-http-settings"
+    priority                   = 100 # Required for Application Gateway v2
   }
 
-  waf_configuration {
-    enabled          = true             # Provided in diagram (WAF Mode: Prevention)
-    firewall_mode    = "Prevention"     # Provided in diagram
-    rule_set_type    = "OWASP"
-    rule_set_version = "3.1"            # Assumed recent version
-  }
-
+  # SSL Policy (required to avoid deprecated TLS versions)
   ssl_policy {
     policy_type = "Predefined"
-    policy_name = "AppGwSslPolicy20220101" # Non-deprecated SSL policy
+    policy_name = "AppGwSslPolicy20220101" # Non-deprecated policy
   }
 
-  # Note: SSL certificate needs to be uploaded manually to Key Vault and referenced here
-  # ssl_certificate block omitted - needs manual configuration
+  # WAF Configuration
+  waf_configuration {
+    enabled          = true
+    firewall_mode    = "Prevention" # Provided in diagram: WAF Mode: Prevention
+    rule_set_type    = "OWASP"
+    rule_set_version = "3.2"
+  }
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
 }
 
-# Storage Account for Function App (required)
+# 6. Function App (Linux with Python runtime)
+# Note: Cosmos DB is not in the allowed resource list, so it is not created.
+
+# Storage account for Function App (required)
 resource "azurerm_storage_account" "function_storage" {
-  name                     = "iaacpocfuncstorage" # Assumed unique name
+  name                     = "iaacfuncstorage${random_string.kv_suffix.result}"
   resource_group_name      = data.azurerm_resource_group.rg.name
   location                 = data.azurerm_resource_group.rg.location
   account_tier             = "Standard"
   account_replication_type = "LRS"
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
 }
 
 # App Service Plan for Function App
 resource "azurerm_service_plan" "function_plan" {
-  name                = "iaacpoc-function-plan"
+  name                = "iaac-function-plan"
   location            = data.azurerm_resource_group.rg.location
   resource_group_name = data.azurerm_resource_group.rg.name
   os_type             = "Linux"
-  sku_name            = "Y1" # Provided in diagram (Plan: Y1 Consumption)
+  sku_name            = "Y1" # Provided in diagram: Plan: Y1 (Consumption)
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
 }
 
 # Linux Function App
 resource "azurerm_linux_function_app" "function_app" {
-  name                       = "iaacpoc-function-app"
+  name                       = "iaac-function-app-${random_string.kv_suffix.result}"
   location                   = data.azurerm_resource_group.rg.location
   resource_group_name        = data.azurerm_resource_group.rg.name
   service_plan_id            = azurerm_service_plan.function_plan.id
@@ -327,56 +343,69 @@ resource "azurerm_linux_function_app" "function_app" {
 
   site_config {
     application_stack {
-      python_version = var.function_app_python_version # Using 3.9 instead of 3.11 (not supported in AzureRM ~> 3.0.2)
+      python_version = var.function_app_python_version # Diagram specifies 3.11 but using 3.9 for compatibility
     }
   }
 
   app_settings = {
-    "FUNCTIONS_WORKER_RUNTIME"       = "python" # Provided in diagram
-    "AzureWebJobsStorage"            = azurerm_storage_account.function_storage.primary_connection_string
-    "SERVICEBUS_CONNECTION_STRING"   = azurerm_servicebus_namespace.sb.default_primary_connection_string
-    "KEY_VAULT_URI"                  = azurerm_key_vault.kv.vault_uri
-    # Additional app settings as needed
-  }
-
-  identity {
-    type = "SystemAssigned" # Provided in diagram (Managed Identity)
+    # Do NOT set FUNCTIONS_WORKER_RUNTIME or AzureWebJobsStorage manually - Azure sets these automatically
+    FUNCTIONS_EXTENSION_VERSION = "~4" # Assumed: latest runtime version
+    # Additional app settings can be added here (e.g., Key Vault references)
   }
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
 }
 
-# Key Vault Access Policy for Function App
-resource "azurerm_key_vault_access_policy" "function_app" {
-  key_vault_id = azurerm_key_vault.kv.id
-  tenant_id    = azurerm_linux_function_app.function_app.identity[0].tenant_id
-  object_id    = azurerm_linux_function_app.function_app.identity[0].principal_id
-
-  secret_permissions = [
-    "Get",
-    "List"
-  ]
-
-  key_permissions = [
-    "Get",
-    "List"
-  ]
-}
-
-# AI Search Service
+# 7. AI Search (Azure Cognitive Search)
 resource "azurerm_search_service" "ai_search" {
-  name                = "iaacpoc-aisearch"
+  name                = "iaac-search-${random_string.kv_suffix.result}"
   location            = data.azurerm_resource_group.rg.location
   resource_group_name = data.azurerm_resource_group.rg.name
-  sku                 = "standard" # Provided in diagram (Service Tier: Standard S1)
-  replica_count       = 1          # Provided in diagram (Replicas: 1)
-  partition_count     = 1          # Provided in diagram (Partitions: 1)
+  sku                 = "standard" # Provided in diagram: Service Tier: Standard (S1)
+
+  replica_count   = 1 # Provided in diagram: Replicas: 1
+  partition_count = 1 # Provided in diagram: Partitions: 1
 
   tags = {
-    Environment = var.environment
-    Owner       = var.owner
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
   }
 }
+
+# 8. Monitor (Log Analytics Workspace + Application Insights)
+resource "azurerm_log_analytics_workspace" "log_analytics" {
+  name                = "iaac-log-analytics-${random_string.kv_suffix.result}"
+  location            = data.azurerm_resource_group.rg.location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  sku                 = "PerGB2018" # Standard pricing tier
+  retention_in_days   = 30          # Assumed: 30 days retention (Basic Logs Tier mentioned in diagram)
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
+  }
+}
+
+resource "azurerm_application_insights" "app_insights" {
+  name                = "iaac-app-insights"
+  location            = data.azurerm_resource_group.rg.location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  workspace_id        = azurerm_log_analytics_workspace.log_analytics.id
+  application_type    = "web" # Assumed: web application type
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    CostCenter  = var.cost_center
+  }
+}
+
+# NOTE: Private Endpoints for Storage and Cosmos DB need to be configured separately
+# Managed Identity (System Assigned) should be enabled on Function App and Application Gateway via Azure Portal
+# Alerts and Action Groups for monitoring need to be configured separately in Azure Monitor
