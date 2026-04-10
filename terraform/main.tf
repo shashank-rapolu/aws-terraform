@@ -1,3 +1,6 @@
+# Terraform configuration for Azure Infrastructure
+# Only supported services are included: Monitor, Service Bus, Function App, App Functions, and AI Search
+
 terraform {
   required_version = ">= 1.5"
   required_providers {
@@ -17,45 +20,117 @@ provider "azurerm" {
     features {}
     skip_provider_registration = true
 
-}
 
-# Reference existing resource group - DO NOT CREATE
+# Reference existing resource group - DO NOT create new resource group
 data "azurerm_resource_group" "rg" {
   name = "Project-IAAC-PoC-RG"
-}
-
-# Current Azure client configuration for Key Vault access policy
-data "azurerm_client_config" "current" {}
-
-# Random suffix for unique naming
-resource "random_string" "suffix" {
-  length  = 6
-  special = false
-  upper   = false
 }
 
 # Variables for configurable values
 variable "environment" {
   description = "Environment tag"
   type        = string
-  default     = "dev" # Assumed value
+  default     = "dev" # Assumed value - not provided in document
 }
 
 variable "owner" {
   description = "Owner tag"
   type        = string
-  default     = "platform-team" # Assumed value
+  default     = "IAAC-Team" # Based on diagram showing Owner: IAAC-Team
 }
 
-variable "function_app_python_version" {
-  description = "Python version for Function App (must be 3.7, 3.8, or 3.9 for AzureRM ~> 3.0.2)"
+variable "function_app_runtime" {
+  description = "Python runtime version for Function App"
   type        = string
-  default     = "3.9" # Assumed value
+  default     = "3.9" # Assumed - must be 3.7, 3.8, or 3.9 for AzureRM ~> 3.0.2
 }
 
-# Storage Account for Function Apps
-resource "azurerm_storage_account" "function_storage" {
-  name                     = "funcstorage${random_string.suffix.result}"
+# Random suffix for Key Vault unique name (to avoid soft-delete conflicts)
+resource "random_string" "kv_suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
+
+# ============================================================================
+# 1. MONITOR (Application Insights with Log Analytics Workspace)
+# ============================================================================
+
+# Log Analytics Workspace (required for Application Insights)
+resource "azurerm_log_analytics_workspace" "law" {
+  name                = "law-iaac-poc"
+  location            = data.azurerm_resource_group.rg.location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30 # Assumed default retention
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    plan        = "Basic Logs Tier" # As shown in diagram
+    costcenter  = "R&D"             # As shown in diagram
+  }
+}
+
+# Application Insights
+resource "azurerm_application_insights" "appinsights" {
+  name                = "appi-iaac-poc"
+  location            = data.azurerm_resource_group.rg.location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  workspace_id        = azurerm_log_analytics_workspace.law.id
+  application_type    = "web" # Assumed - appropriate for monitoring function apps
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    plan        = "Basic Logs Tier"
+    costcenter  = "R&D"
+  }
+}
+
+# ============================================================================
+# 5. SERVICE BUS
+# ============================================================================
+
+resource "azurerm_servicebus_namespace" "sb" {
+  name                = "sb-iaac-poc"
+  location            = data.azurerm_resource_group.rg.location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  sku                 = "Standard" # Assumed - Standard supports topics and queues
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    costcenter  = "R&D"
+  }
+}
+
+# Service Bus Queue (for queue routing as shown in diagram)
+resource "azurerm_servicebus_queue" "queue" {
+  name         = "messages-queue"
+  namespace_id = azurerm_servicebus_namespace.sb.id
+}
+
+# Service Bus Topic (for topic routing as shown in diagram)
+resource "azurerm_servicebus_topic" "topic" {
+  name         = "messages-topic"
+  namespace_id = azurerm_servicebus_namespace.sb.id
+}
+
+# Service Bus Topic Subscription (assumed - needed for topic routing)
+resource "azurerm_servicebus_subscription" "sub" {
+  name               = "messages-subscription"
+  topic_id           = azurerm_servicebus_topic.topic.id
+  max_delivery_count = 10 # Assumed default
+}
+
+# ============================================================================
+# 7. FUNCTION APP (azurerm_linux_function_app)
+# ============================================================================
+
+# Storage Account for Function App (required)
+resource "azurerm_storage_account" "funcapp_storage" {
+  name                     = "stfunciaacpoc"
   resource_group_name      = data.azurerm_resource_group.rg.name
   location                 = data.azurerm_resource_group.rg.location
   account_tier             = "Standard"
@@ -64,12 +139,71 @@ resource "azurerm_storage_account" "function_storage" {
   tags = {
     environment = var.environment
     owner       = var.owner
+    costcenter  = "R&D"
   }
 }
 
-# Azure Storage Account for Document Storage (Blob Storage)
-resource "azurerm_storage_account" "document_storage" {
-  name                     = "docstorage${random_string.suffix.result}"
+# App Service Plan for Function App
+resource "azurerm_service_plan" "asp_funcapp" {
+  name                = "asp-funcapp-iaac-poc"
+  location            = data.azurerm_resource_group.rg.location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  os_type             = "Linux"
+  sku_name            = "Y1" # Consumption plan - assumed for serverless
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    costcenter  = "R&D"
+  }
+}
+
+# Linux Function App #7 (Relay Messages, Trigger Functions, Queue & Topic Routing)
+resource "azurerm_linux_function_app" "funcapp" {
+  name                       = "func-relay-iaac-poc"
+  location                   = data.azurerm_resource_group.rg.location
+  resource_group_name        = data.azurerm_resource_group.rg.name
+  service_plan_id            = azurerm_service_plan.asp_funcapp.id
+  storage_account_name       = azurerm_storage_account.funcapp_storage.name
+  storage_account_access_key = azurerm_storage_account.funcapp_storage.primary_access_key
+
+  site_config {
+    application_stack {
+      python_version = var.function_app_runtime # Must be 3.7, 3.8, or 3.9
+    }
+    application_insights_key               = azurerm_application_insights.appinsights.instrumentation_key
+    application_insights_connection_string = azurerm_application_insights.appinsights.connection_string
+  }
+
+  app_settings = {
+    # DO NOT set FUNCTIONS_WORKER_RUNTIME, AzureWebJobsStorage, or FUNCTIONS_EXTENSION_VERSION
+    # Azure sets these automatically based on application_stack and storage_account configuration
+    
+    # Service Bus connection for relay and routing functionality
+    "ServiceBusConnection" = azurerm_servicebus_namespace.sb.default_primary_connection_string
+
+    # Application Insights for monitoring
+    "APPINSIGHTS_INSTRUMENTATIONKEY" = azurerm_application_insights.appinsights.instrumentation_key
+  }
+
+  identity {
+    type = "SystemAssigned" # Managed Identity as shown in diagram
+  }
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    costcenter  = "R&D"
+  }
+}
+
+# ============================================================================
+# 9. APP FUNCTIONS (Serverless Functions for processing)
+# ============================================================================
+
+# Storage Account for App Functions
+resource "azurerm_storage_account" "appfunc_storage" {
+  name                     = "stappfunciaacpoc"
   resource_group_name      = data.azurerm_resource_group.rg.name
   location                 = data.azurerm_resource_group.rg.location
   account_tier             = "Standard"
@@ -78,24 +212,98 @@ resource "azurerm_storage_account" "document_storage" {
   tags = {
     environment = var.environment
     owner       = var.owner
+    costcenter  = "R&D"
   }
 }
 
-# Azure Storage Private Endpoint - Assumed for "Azure Storage Private Endpoint /28" in diagram
-# Note: Private Endpoint creation requires a VNet and Subnet which are not shown in the diagram
-# This is a placeholder comment - requires manual VNet/Subnet configuration
+# App Service Plan for App Functions
+resource "azurerm_service_plan" "asp_appfunc" {
+  name                = "asp-appfunc-iaac-poc"
+  location            = data.azurerm_resource_group.rg.location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  os_type             = "Linux"
+  sku_name            = "Y1" # Consumption plan - serverless
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    costcenter  = "R&D"
+  }
+}
+
+# Linux Function App #9 (Process Events, Enrich Metadata)
+resource "azurerm_linux_function_app" "appfunc" {
+  name                       = "func-process-iaac-poc"
+  location                   = data.azurerm_resource_group.rg.location
+  resource_group_name        = data.azurerm_resource_group.rg.name
+  service_plan_id            = azurerm_service_plan.asp_appfunc.id
+  storage_account_name       = azurerm_storage_account.appfunc_storage.name
+  storage_account_access_key = azurerm_storage_account.appfunc_storage.primary_access_key
+
+  site_config {
+    application_stack {
+      python_version = var.function_app_runtime
+    }
+    application_insights_key               = azurerm_application_insights.appinsights.instrumentation_key
+    application_insights_connection_string = azurerm_application_insights.appinsights.connection_string
+  }
+
+  app_settings = {
+    # DO NOT set FUNCTIONS_WORKER_RUNTIME, AzureWebJobsStorage, or FUNCTIONS_EXTENSION_VERSION
+    
+    # AI Search connection for search & index data functionality
+    "AzureSearchEndpoint" = "https://${azurerm_search_service.search.name}.search.windows.net"
+    "AzureSearchKey"      = azurerm_search_service.search.primary_key
+
+    # Application Insights for monitoring
+    "APPINSIGHTS_INSTRUMENTATIONKEY" = azurerm_application_insights.appinsights.instrumentation_key
+  }
+
+  identity {
+    type = "SystemAssigned" # Managed Identity for secure access
+  }
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    costcenter  = "R&D"
+  }
+}
+
+# ============================================================================
+# 8. AI SEARCH
+# ============================================================================
+
+resource "azurerm_search_service" "search" {
+  name                = "search-iaac-poc"
+  resource_group_name = data.azurerm_resource_group.rg.name
+  location            = data.azurerm_resource_group.rg.location
+  sku                 = "basic" # Assumed - basic tier for development
+
+  tags = {
+    environment = var.environment
+    owner       = var.owner
+    costcenter  = "R&D"
+  }
+}
+
+# ============================================================================
+# KEY VAULT (Security - Key Vault Integration for secrets as shown in diagram)
+# ============================================================================
+
+# Current Azure client configuration for Key Vault access policy
+data "azurerm_client_config" "current" {}
 
 # Key Vault with unique name to avoid soft-delete conflicts
 resource "azurerm_key_vault" "kv" {
-  name                        = "kv-${random_string.suffix.result}"
-  location                    = data.azurerm_resource_group.rg.location
-  resource_group_name         = data.azurerm_resource_group.rg.name
-  tenant_id                   = data.azurerm_client_config.current.tenant_id
-  sku_name                    = "standard"
-  purge_protection_enabled    = false
-  soft_delete_retention_days  = 7
+  name                       = "kv-iaac-${random_string.kv_suffix.result}"
+  location                   = data.azurerm_resource_group.rg.location
+  resource_group_name        = data.azurerm_resource_group.rg.name
+  tenant_id                  = data.azurerm_client_config.current.tenant_id
+  sku_name                   = "standard"
+  purge_protection_enabled   = false # Allow Terraform to clean up
+  soft_delete_retention_days = 7
 
-  # Network ACLs to allow access and avoid firewall errors
   network_acls {
     default_action = "Allow"
     bypass         = "AzureServices"
@@ -104,11 +312,12 @@ resource "azurerm_key_vault" "kv" {
   tags = {
     environment = var.environment
     owner       = var.owner
+    costcenter  = "R&D"
   }
 }
 
-# Key Vault Access Policy for current deployment principal
-resource "azurerm_key_vault_access_policy" "deployer_policy" {
+# Access policy for current deployer
+resource "azurerm_key_vault_access_policy" "deployer" {
   key_vault_id = azurerm_key_vault.kv.id
   tenant_id    = data.azurerm_client_config.current.tenant_id
   object_id    = data.azurerm_client_config.current.object_id
@@ -122,254 +331,50 @@ resource "azurerm_key_vault_access_policy" "deployer_policy" {
   ]
 }
 
-# NOTE: Do NOT create Key Vault secrets in Terraform due to firewall propagation delays.
-# After deployment, manually create secrets via Azure Portal or CLI:
-# - "OpenAI Prereq Subnet" secrets (as shown in diagram)
-# - Any other required secrets for your application
+# Access policy for Function App #7 (relay messages)
+resource "azurerm_key_vault_access_policy" "funcapp" {
+  key_vault_id = azurerm_key_vault.kv.id
+  tenant_id    = azurerm_linux_function_app.funcapp.identity[0].tenant_id
+  object_id    = azurerm_linux_function_app.funcapp.identity[0].principal_id
 
-# Service Bus Namespace
-resource "azurerm_servicebus_namespace" "sb" {
-  name                = "sb-namespace-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  sku                 = "Standard" # Assumed value
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
+  secret_permissions = [
+    "Get",
+    "List"
+  ]
 }
 
-# Service Bus Queue - "Incoming PNG Endpoint Subnet /28"
-resource "azurerm_servicebus_queue" "incoming_queue" {
-  name         = "incoming-png-endpoint"
-  namespace_id = azurerm_servicebus_namespace.sb.id
+# Access policy for App Functions #9 (process events)
+resource "azurerm_key_vault_access_policy" "appfunc" {
+  key_vault_id = azurerm_key_vault.kv.id
+  tenant_id    = azurerm_linux_function_app.appfunc.identity[0].tenant_id
+  object_id    = azurerm_linux_function_app.appfunc.identity[0].principal_id
+
+  secret_permissions = [
+    "Get",
+    "List"
+  ]
 }
 
-# Service Bus Queue - "Outgoing VNETINT Subnet /28"
-resource "azurerm_servicebus_queue" "outgoing_queue" {
-  name         = "outgoing-vnetint"
-  namespace_id = azurerm_servicebus_namespace.sb.id
-}
+# NOTE: Do NOT create azurerm_key_vault_secret resources in Terraform
+# Azure Key Vault firewall propagation causes persistent "ForbiddenByFirewall" errors
+# Create secrets manually via Azure Portal or CLI after deployment:
+# - ServiceBus connection strings
+# - AI Search keys
+# - Application Insights keys
+# - Any other sensitive configuration values
 
-# App Service Plan for Function Apps
-resource "azurerm_service_plan" "asp" {
-  name                = "asp-functions-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  os_type             = "Linux"
-  sku_name            = "B1" # Assumed value - Basic tier
+# ============================================================================
+# NOTES ON EXCLUDED SERVICES
+# ============================================================================
 
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
+# The diagram shows connections and dependencies that are NOT in the supported list:
+# - Cosmos DB (mentioned in security section for private endpoints)
+# - Application Gateway WAF (networking section) - Application Gateway resource creation is supported but not included as it's not clearly depicted as a resource node
+# These services are ignored per instruction #6 and #7
 
-# Azure Function App - App Services
-resource "azurerm_linux_function_app" "func_app" {
-  name                       = "func-app-${random_string.suffix.result}"
-  location                   = data.azurerm_resource_group.rg.location
-  resource_group_name        = data.azurerm_resource_group.rg.name
-  service_plan_id            = azurerm_service_plan.asp.id
-  storage_account_name       = azurerm_storage_account.function_storage.name
-  storage_account_access_key = azurerm_storage_account.function_storage.primary_access_key
-
-  site_config {
-    application_stack {
-      python_version = var.function_app_python_version
-    }
-  }
-
-  # DO NOT set FUNCTIONS_WORKER_RUNTIME, AzureWebJobsStorage, or FUNCTIONS_EXTENSION_VERSION
-  # Azure automatically configures these based on application_stack and storage_account settings
-  app_settings = {
-    # Add custom app settings here if needed
-  }
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
-
-# Log Analytics Workspace for Application Insights
-resource "azurerm_log_analytics_workspace" "law" {
-  name                = "law-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  sku                 = "PerGB2018"
-  retention_in_days   = 30
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
-
-# Application Insights
-resource "azurerm_application_insights" "appinsights" {
-  name                = "appinsights-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  workspace_id        = azurerm_log_analytics_workspace.law.id
-  application_type    = "web"
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
-
-# Azure AI Search (formerly Cognitive Search)
-resource "azurerm_search_service" "search" {
-  name                = "search-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  sku                 = "standard" # Assumed value
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
-
-# Azure Document Intelligence (Form Recognizer)
-resource "azurerm_cognitive_account" "doc_intelligence" {
-  name                = "docintel-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  kind                = "FormRecognizer"
-  sku_name            = "S0"
-  custom_subdomain_name = "docintel-${random_string.suffix.result}" # Required for token-based auth
-
-  network_acls {
-    default_action = "Allow"
-  }
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
-
-# Azure OpenAI Cognitive Service
-
-# Application Gateway
-# Note: SSL certificates and private endpoint subnets require manual configuration or separate VNet resources
-# Using HTTP (port 80) for listener and backend since SSL certificates cannot be auto-provisioned
-
-# Public IP for Application Gateway
-resource "azurerm_public_ip" "appgw_pip" {
-  name                = "appgw-pip-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  allocation_method   = "Static"
-  sku                 = "Standard"
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
-
-# NOTE: Application Gateway requires a VNet and Subnet which are not defined in the diagram
-# The following is a placeholder - you must create or reference an existing VNet/Subnet
-
-# Placeholder VNet for Application Gateway (assumed)
-resource "azurerm_virtual_network" "vnet" {
-  name                = "vnet-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  address_space       = ["10.0.0.0/16"] # Assumed value
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
-
-# Subnet for Application Gateway
-resource "azurerm_subnet" "appgw_subnet" {
-  name                 = "appgw-subnet"
-  resource_group_name  = data.azurerm_resource_group.rg.name
-  virtual_network_name = azurerm_virtual_network.vnet.name
-  address_prefixes     = ["10.0.1.0/24"] # Assumed value
-}
-
-# Application Gateway
-resource "azurerm_application_gateway" "appgw" {
-  name                = "appgw-${random_string.suffix.result}"
-  location            = data.azurerm_resource_group.rg.location
-  resource_group_name = data.azurerm_resource_group.rg.name
-
-  sku {
-    name     = "Standard_v2" # Assumed value
-    tier     = "Standard_v2"
-    capacity = 2 # Assumed value
-  }
-
-  gateway_ip_configuration {
-    name      = "gateway-ip-config"
-    subnet_id = azurerm_subnet.appgw_subnet.id
-  }
-
-  frontend_port {
-    name = "http-port"
-    port = 80
-  }
-
-  frontend_ip_configuration {
-    name                 = "frontend-ip-config"
-    public_ip_address_id = azurerm_public_ip.appgw_pip.id
-  }
-
-  backend_address_pool {
-    name = "backend-pool"
-    # Backend targets should be manually configured or added via variables
-  }
-
-  backend_http_settings {
-    name                  = "http-settings"
-    cookie_based_affinity = "Disabled"
-    port                  = 80
-    protocol              = "Http"
-    request_timeout       = 30
-  }
-
-  http_listener {
-    name                           = "http-listener"
-    frontend_ip_configuration_name = "frontend-ip-config"
-    frontend_port_name             = "http-port"
-    protocol                       = "Http"
-  }
-
-  request_routing_rule {
-    name                       = "routing-rule"
-    rule_type                  = "Basic"
-    http_listener_name         = "http-listener"
-    backend_address_pool_name  = "backend-pool"
-    backend_http_settings_name = "http-settings"
-    priority                   = 100
-  }
-
-  # SSL Policy to avoid deprecated TLS versions
-  ssl_policy {
-    policy_type = "Predefined"
-    policy_name = "AppGwSslPolicy20220101"
-  }
-
-  # NOTE: SSL certificates must be configured manually or via separate automation
-  # Add ssl_certificate block and update listeners/settings for HTTPS if needed
-
-  tags = {
-    environment = var.environment
-    owner       = var.owner
-  }
-}
-
-# Note: Managed Identities shown in the diagram should be created and assigned manually or via separate automation
-# - "Managed Identity for OpenAI"
-# - "Managed Identity for Azure AI Search"
-# - "Managed Identity for Storage"
-# These can be created using azurerm_user_assigned_identity and assigned to respective resources
+# Manual configuration required:
+# - Application Gateway WAF setup (if needed for HTTPS TLS 1.2 as shown in diagram)
+# - Private Endpoints for Storage and other services (shown in security section)
+# - VNet Integration (shown as optional in networking section)
+# - Diagnostic Settings configuration in Azure Monitor
+# - Action Groups for alerts on failures (shown in monitoring section)
